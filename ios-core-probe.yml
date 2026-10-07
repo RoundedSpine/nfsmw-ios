@@ -1,0 +1,145 @@
+name: iOS core probe
+
+# M1 for the NFSMW iOS port: does the stock rexglue-sdk configure and compile
+# for iOS (arm64, device SDK)? No game files are involved, so this can live in
+# a PUBLIC repository (macOS minutes are free there).
+#
+# It is an exploratory job. It is expected to fail at first. Its purpose is to
+# collect EVERY error in one run (ninja -k 0) and publish them in the job
+# summary and as a downloadable log, so each fix is one targeted edit.
+#
+# Put this file at .github/workflows/ios-core-probe.yml, then
+# Actions -> "iOS core probe" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: rexglue-sdk tag or branch to test
+        required: true
+        default: v0.10.0
+      target:
+        description: Build target ("all" builds everything the SDK defines)
+        required: true
+        default: all
+      extra_cmake_args:
+        description: Extra arguments for the configure step
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: SDK ${{ inputs.sdk_ref }} on iOS arm64
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    env:
+      SDK_REF: ${{ inputs.sdk_ref }}
+      BUILD_TARGET: ${{ inputs.target }}
+      EXTRA_CMAKE_ARGS: ${{ inputs.extra_cmake_args }}
+
+    steps:
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install build tools
+        run: brew install cmake ninja
+
+      - name: Toolchain versions
+        run: |
+          mkdir -p logs
+          {
+            sw_vers
+            xcodebuild -version
+            echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+            cmake --version | head -1
+            echo "ninja $(ninja --version)"
+            python3 --version
+          } | tee logs/toolchain.txt
+
+      - name: Clone rexglue-sdk
+        run: |
+          git clone --branch "$SDK_REF" --depth 1 \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/rexglue/rexglue-sdk.git sdk
+          git -C sdk log -1 --format='%H %s' | tee logs/sdk-revision.txt
+
+      - name: Configure for iOS (arm64, device SDK)
+        id: configure
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # shellcheck disable=SC2086
+          cmake -S sdk -B build/ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREXGLUE_BUILD_TESTS=OFF \
+            -DREXGLUE_USE_D3D12=OFF \
+            -DREXGLUE_USE_VULKAN=OFF \
+            -DREXGLUE_ENABLE_FIDELITYFX=OFF \
+            -DREXGLUE_ENABLE_TRACY=OFF \
+            $EXTRA_CMAKE_ARGS 2>&1 | tee logs/configure.log
+
+      - name: List targets
+        if: steps.configure.outcome == 'success'
+        run: |
+          cmake --build build/ios --target help > logs/targets.txt 2>&1 || true
+          head -60 logs/targets.txt
+
+      - name: Build (keep going to collect every error)
+        id: build
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cmake --build build/ios --target "$BUILD_TARGET" --parallel 4 \
+            -- -k 0 2>&1 | tee logs/build.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## iOS core probe"
+            echo
+            echo "- SDK: \`$SDK_REF\` ($(cut -c1-12 logs/sdk-revision.txt 2>/dev/null))"
+            echo "- configure: ${{ steps.configure.outcome }}"
+            echo "- build: ${{ steps.build.outcome }}"
+            echo
+            echo "### CMake errors and warnings (first 25)"
+            echo '```'
+            grep -n -m 25 -E 'CMake Error|CMake Warning' logs/configure.log 2>/dev/null || true
+            echo '```'
+            echo
+            echo "### Compiler/linker errors (first 40 lines)"
+            echo '```'
+            grep -h -m 40 -E 'error:|fatal error:|undefined symbol|ld: ' logs/build.log 2>/dev/null || true
+            echo '```'
+            echo
+            echo "Total \`error:\` lines in build log: $(grep -c 'error:' logs/build.log 2>/dev/null || echo 0)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-core-probe-logs
+          path: |
+            logs/
+            build/ios/CMakeCache.txt
+            build/ios/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # The steps above continue on error so the logs always upload. Fail the
+      # job here so a red run means "something needs fixing".
+      - name: Report result
+        if: steps.configure.outcome != 'success' || steps.build.outcome != 'success'
+        run: |
+          echo "configure=${{ steps.configure.outcome }} build=${{ steps.build.outcome }}"
+          exit 1
